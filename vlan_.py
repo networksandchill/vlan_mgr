@@ -1,166 +1,281 @@
 #!/usr/bin/env python3
-
+"""
+Enhanced VLAN management script with gateway support, dynamic route metrics,
+error handling, and configuration.
+"""
+import argparse
 import os
+import sys
 import subprocess
-import time
+import ipaddress
+import logging
+import json
+import tempfile
 
-# Path where the interfaces are stored
-interfaces_path = '/etc/network/interfaces.d/'
-user_confirmation = None  # Global variable to store user confirmation
-original_ip = None
-original_netmask = None
+# Defaults
+INTERFACES_DIR_DEFAULT = '/etc/network/interfaces.d'
+DEFAULT_BASE_IFACE = 'eth0'
+# Base metric if no existing default metric found
+DEFAULT_ROUTE_METRIC = 1000
 
-def interface_exists(interface):
-    """Check if a network interface exists."""
-    result = subprocess.run(['ip', 'link', 'show', interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    return result.returncode == 0
 
-def get_interface_ip_and_netmask(interface):
-    """Get the current IP address and netmask of the interface."""
-    result = subprocess.run(['ip', 'addr', 'show', interface], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    output = result.stdout.decode()
-    
-    ip_address = None
-    netmask = None
+def setup_logger():
+    logger = logging.getLogger('vlan_manager')
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    return logger
 
-    # Look for the line containing the IP address and netmask
-    for line in output.splitlines():
-        if 'inet ' in line:
-            # The line should look like: "inet 192.168.1.100/24 ..."
-            ip_with_mask = line.split()[1]
-            ip_address, prefix_length = ip_with_mask.split('/')
-            netmask = prefix_to_netmask(int(prefix_length))
-            break
+logger = setup_logger()
 
-    return ip_address, netmask
+
+def require_root():
+    if os.geteuid() != 0:
+        logger.error("Must run as root.")
+        sys.exit(1)
+
+
+def run_command(cmd, check=True):
+    logger.debug(f"Cmd: {' '.join(cmd)}")
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Cmd failed: {' '.join(cmd)}\n{e.stderr.strip()}")
+        return None
+    except OSError as e:
+        logger.error(f"Execution failed: {e}")
+        sys.exit(1)
+
+
+def interface_exists(iface):
+    res = run_command(['ip', 'link', 'show', iface], check=False)
+    return bool(res and res.returncode == 0)
+
+
+def get_interface_info(iface):
+    """Return (ip, prefixlen) or (None, None)."""
+    res = run_command(['ip', '-j', 'addr', 'show', iface], check=False)
+    if res and res.returncode == 0:
+        try:
+            data = json.loads(res.stdout)
+            info = data[0].get('addr_info', [])
+            if info:
+                return info[0]['local'], info[0]['prefixlen']
+        except json.JSONDecodeError:
+            pass
+    res = run_command(['ip', '-br', 'addr', 'show', iface], check=False)
+    if res and res.returncode == 0:
+        parts = res.stdout.split()
+        if len(parts) >= 3:
+            try:
+                ip_str, prefix = parts[2].split('/')
+                return ip_str, int(prefix)
+            except Exception:
+                pass
+    return None, None
+
+
+def get_current_max_metric():
+    res = run_command(['ip', 'route', 'show', 'default'], check=False)
+    max_metric = 0
+    if res and res.stdout:
+        for line in res.stdout.splitlines():
+            parts = line.split()
+            if 'metric' in parts:
+                try:
+                    idx = parts.index('metric') + 1
+                    m = int(parts[idx])
+                    max_metric = max(max_metric, m)
+                except Exception:
+                    pass
+            else:
+                max_metric = max(max_metric, DEFAULT_ROUTE_METRIC)
+    return max_metric
+
 
 def prefix_to_netmask(prefix):
-    """Convert a prefix length (e.g., 24) to a netmask (e.g., 255.255.255.0)."""
-    mask = (0xffffffff >> (32 - prefix)) << (32 - prefix)
-    return f"{(mask >> 24) & 255}.{(mask >> 16) & 255}.{(mask >> 8) & 255}.{mask & 255}"
+    try:
+        return str(ipaddress.IPv4Network(f"0.0.0.0/{prefix}").netmask)
+    except Exception:
+        logger.error(f"Invalid prefix {prefix}")
+        sys.exit(1)
 
-def bring_vlan_up(vlan_id, ip_address, netmask):
-    vlan_interface = f"eth0.{vlan_id}"
-    config_file = os.path.join(interfaces_path, vlan_interface)
 
-    # Create the VLAN configuration file
-    with open(config_file, 'w') as f:
-        f.write(f"auto {vlan_interface}\n")
-        f.write(f"iface {vlan_interface} inet static\n")
-        f.write(f"    address {ip_address}\n")
-        f.write(f"    netmask {netmask}\n")
-        f.write(f"    vlan-raw-device eth0\n")
+def store_configuration(iface):
+    ip_addr, pref = get_interface_info(iface)
+    mask = prefix_to_netmask(pref) if pref is not None else None
+    logger.info(f"Stored cfg {iface}: ip={ip_addr}, prefix={pref}, netmask={mask}")
+    return {'ip': ip_addr, 'prefix': pref, 'netmask': mask}
 
-    print(f"VLAN {vlan_interface} configuration written to {config_file}")
 
-    # Bring up the interface
-    subprocess.run(['sudo', 'ifup', vlan_interface], check=True)
-    print(f"{vlan_interface} is up.")
+def write_config_file(path, lines):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path))
+    with os.fdopen(fd, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    os.replace(tmp, path)
+    logger.info(f"Wrote config to {path}")
 
-def bring_vlan_down(vlan_id):
-    vlan_interface = f"eth0.{vlan_id}"
-    config_file = os.path.join(interfaces_path, vlan_interface)
 
-    if not interface_exists(vlan_interface):
-        print(f"Interface {vlan_interface} does not exist or is already down.")
+def rollback_configuration(base, vlan, saved):
+    iface = f"{base}.{vlan}"
+    if not interface_exists(iface):
+        run_command(['ip', 'link', 'add', 'link', base, 'name', iface,
+                     'type', 'vlan', 'id', str(vlan)])
+    run_command(['ip', 'link', 'set', iface, 'down'])
+    run_command(['ip', 'addr', 'flush', 'dev', iface])
+    ip_addr = saved.get('ip'); pref = saved.get('prefix')
+    if ip_addr and pref:
+        run_command(['ip', 'addr', 'add', f"{ip_addr}/{pref}", 'dev', iface])
+    run_command(['ip', 'link', 'set', iface, 'up'])
+    logger.info(f"Rolled back {iface}")
+
+
+def bring_vlan_up(args):
+    base = args.base_interface
+    vlan = args.vlan_id
+    iface = f"{base}.{vlan}"
+    saved = store_configuration(iface)
+
+    # Determine mode and plan
+    if args.dhcp:
+        plan = 'DHCP'; ip_str = None; prefix = None
+    else:
+        iface_obj = ipaddress.IPv4Interface(args.ip)
+        ip_str = str(iface_obj.ip)
+        prefix = iface_obj.network.prefixlen
+        plan = f"static {ip_str}/{prefix}"
+
+    if not args.no_confirm:
+        logger.info(f"Plan: {plan} on {iface}")
+        if input("Apply? (yes/no): ").strip().lower() != 'yes':
+            logger.info("Cancelled.")
+            return
+
+    # Build interfaces file (omit gateway)
+    lines = [f"auto {iface}",
+             f"iface {iface} inet {'dhcp' if args.dhcp else 'static'}"]
+    if not args.dhcp:
+        netmask = prefix_to_netmask(prefix)
+        lines += [f"    address {ip_str}",
+                  f"    netmask {netmask}",
+                  f"    vlan-raw-device {base}"]
+
+    try:
+        write_config_file(os.path.join(args.config_dir, iface), lines)
+        res = run_command(['ifup', iface])
+        if not res or res.returncode != 0:
+            raise RuntimeError(f"ifup failed for {iface}")
+
+        # If a gateway was specified, delete auto routes then add ours
+        if not args.dhcp and args.gateway:
+            run_command(['ip', 'route', 'del', 'default', 'dev', iface], check=False)
+            existing_max = get_current_max_metric()
+            desired = max(existing_max + 1, args.metric)
+            run_command(['ip', 'route', 'add', 'default', 'via', args.gateway,
+                         'dev', iface, 'metric', str(desired)])
+            logger.info(f"Set default via {args.gateway} metric {desired}")
+
+        logger.info(f"{iface} is up")
+    except Exception as e:
+        logger.error(f"Error: {e}, rolling back")
+        rollback_configuration(base, vlan, saved)
+
+
+def bring_vlan_down(args):
+    base = args.base_interface
+    vlan = args.vlan_id
+    iface = f"{base}.{vlan}"
+    config_path = os.path.join(args.config_dir, iface)
+
+    if not interface_exists(iface):
+        logger.warning(f"{iface} does not exist")
         return
 
-    # Bring down the interface
-    subprocess.run(['sudo', 'ifdown', vlan_interface], check=True)
-    print(f"{vlan_interface} is down.")
+    saved = store_configuration(iface)
+    if not args.no_confirm:
+        if input(f"Bring down {iface}? (yes/no): ").strip().lower() != 'yes':
+            logger.info("Cancelled.")
+            return
 
-    # Remove the VLAN configuration file
-    if os.path.exists(config_file):
-        os.remove(config_file)
-        print(f"Configuration for {vlan_interface} removed from {config_file}.")
-    else:
-        print(f"Configuration file {config_file} does not exist.")
+    try:
+        run_command(['ifdown', iface])
+        if os.path.exists(config_path):
+            os.remove(config_path)
+            logger.info(f"Removed config file {config_path}")
+    except Exception as e:
+        logger.error(f"Error during bring down: {e}")
 
-def confirm_input_with_timer(vlan_id, action, timer=60):
-    """Function to confirm the changes or rollback after the timer with input validation."""
-    global user_confirmation, original_ip, original_netmask
 
-    # Inform the user about the confirmation time
-    print(f"You have {timer} seconds to CONFIRM or ROLLBACK before changes are reverted.")
-    
-    # Start countdown and input validation loop
-    start_time = time.time()
-    remaining_time = timer
+def parse_args():
+    example_text = '''
+Examples:
+  # Static VLAN up with CIDR and gateway, safe metric above existing
+  vlan_manager.py 314 up --ip 192.0.2.10/24 \
+      --gateway 192.0.2.1 --metric 200
 
-    while remaining_time > 0:
-        user_confirmation = input("> ").strip().lower()
+  # DHCP VLAN up without prompts
+  vlan_manager.py 314 up --dhcp --no-confirm
 
-        if user_confirmation not in ['confirm', 'rollback']:
-            # Reject invalid input, show remaining time and prompt again
-            elapsed_time = time.time() - start_time
-            remaining_time = max(0, timer - int(elapsed_time))
-            print(f"Invalid input. You have {remaining_time} seconds remaining to CONFIRM or ROLLBACK.")
-        else:
-            break
+  # VLAN down
+  vlan_manager.py 314 down
+'''
+    parser = argparse.ArgumentParser(
+        description="Manage VLAN interfaces on Debian-style systems.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=example_text
+    )
+    parser.add_argument('vlan_id', type=int,
+                        help='VLAN ID (1–4094)')
+    parser.add_argument('action', choices=['up', 'down'],
+                        help='"up" to configure and bring up; "down" to bring down and remove config.')
+    parser.add_argument('--ip',
+                        help='IPv4 in CIDR (e.g. 192.0.2.10/24) for static mode; required unless --dhcp.')
+    parser.add_argument('--dhcp', action='store_true',
+                        help='Use DHCP; skips --ip requirement.')
+    parser.add_argument('--gateway',
+                        help='Gateway IP for default route (optional).')
+    parser.add_argument('--metric', type=int, default=DEFAULT_ROUTE_METRIC,
+                        help=f'Base route metric (default: {DEFAULT_ROUTE_METRIC}); script raises above existing.')
+    parser.add_argument('--base-interface', default=DEFAULT_BASE_IFACE,
+                        help='Underlying interface (default: eth0).')
+    parser.add_argument('--config-dir', default=INTERFACES_DIR_DEFAULT,
+                        help='Directory for interfaces.d files (default: /etc/network/interfaces.d).')
+    parser.add_argument('--no-confirm', action='store_true',
+                        help='Skip confirmation prompts.')
+    return parser.parse_args()
 
-        elapsed_time = time.time() - start_time
-        remaining_time = max(0, timer - int(elapsed_time))
-
-    # Handle valid input or timer expiry
-    if remaining_time > 0 and user_confirmation == 'confirm':
-        print("Changes confirmed.")
-    elif user_confirmation == 'rollback' or remaining_time <= 0:
-        # Either no valid input in time or user chose to rollback
-        if action == 'up':
-            bring_vlan_down(vlan_id)
-            if original_ip and original_netmask:
-                print(f"Rolling back to original IP: {original_ip} and netmask: {original_netmask}")
-                bring_vlan_up(vlan_id, original_ip, original_netmask)
-            else:
-                print(f"Changes reverted: VLAN {vlan_id} has been rolled back.")
-        elif action == 'down':
-            bring_vlan_up(vlan_id, original_ip or "192.168.1.1", original_netmask or "255.255.255.0")  # Use previous IP if available
-            print(f"Changes reverted: VLAN {vlan_id} has been rolled back.")
-    else:
-        print(f"Confirmation failed: VLAN {vlan_id} has been automatically rolled back due to no valid input.")
 
 def main():
-    global user_confirmation, original_ip, original_netmask
-    user_confirmation = None  # Reset the confirmation state for each run
+    args = parse_args()
+    if os.geteuid() != 0 and not any(o in sys.argv for o in ('-h', '--help')):
+        require_root()
 
-    # Get user input for VLAN ID
-    vlan_id = input("Enter VLAN ID (e.g., 314): ").strip()
+    if not (1 <= args.vlan_id <= 4094):
+        logger.error("VLAN ID must be between 1 and 4094")
+        sys.exit(1)
 
-    # Validate VLAN ID
-    if not vlan_id.isdigit():
-        print("Invalid VLAN ID. It must be a number.")
-        return
+    if args.action == 'up' and not args.dhcp:
+        if not args.ip:
+            logger.error("Static mode requires --ip in CIDR.")
+            sys.exit(1)
+        try:
+            ipaddress.IPv4Interface(args.ip)
+        except ValueError:
+            logger.error("Invalid CIDR for --ip.")
+            sys.exit(1)
+        if args.gateway:
+            try:
+                ipaddress.IPv4Address(args.gateway)
+            except ValueError:
+                logger.error("Invalid gateway IP.")
+                sys.exit(1)
 
-    vlan_interface = f"eth0.{vlan_id}"
-
-    # Get the current IP and netmask of the interface (if it exists)
-    if interface_exists(vlan_interface):
-        original_ip, original_netmask = get_interface_ip_and_netmask(vlan_interface)
-        print(f"Current IP: {original_ip}, Netmask: {original_netmask}")
-
-    # Get action input (up or down)
-    action = input("Do you want to bring VLAN up or down? (up/down): ").strip().lower()
-
-    if action == 'up':
-        # Get IP address and netmask for 'up' action
-        ip_address = input("Enter IP address (e.g., 192.168.1.100): ").strip()
-        netmask = input("Enter netmask (e.g., 255.255.255.0): ").strip()
-
-        # Bring the VLAN up
-        bring_vlan_up(vlan_id, ip_address, netmask)
-
-        # Start the confirm timer with input validation
-        confirm_input_with_timer(vlan_id, 'up', 60)
-
-    elif action == 'down':
-        # Bring the VLAN down with a confirm timer
-        bring_vlan_down(vlan_id)
-
-        # Start the confirm timer for bringing down
-        confirm_input_with_timer(vlan_id, 'down', 60)
-
+    if args.action == 'up':
+        bring_vlan_up(args)
     else:
-        print("Invalid action. Use 'up' or 'down'.")
+        bring_vlan_down(args)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
