@@ -13,6 +13,7 @@ import json
 import tempfile
 import re
 import shlex
+import shutil
 
 # Defaults
 INTERFACES_DIR_DEFAULT = '/etc/network/interfaces.d'
@@ -40,7 +41,7 @@ def require_root():
 
 def sanitize_interface_name(name):
     """Sanitize interface name to prevent command injection."""
-    if not re.match(r'^[a-zA-Z0-9._-]+$', name):
+    if not re.match(r'^[a-zA-Z0-9.-]+$', name):
         raise ValueError(f"Invalid interface name: {name}")
     return name
 
@@ -59,11 +60,11 @@ def sanitize_vlan_id(vlan_id):
     return str(vlan_id)
 
 def run_command(cmd, check=True):
-    logger.debug(f"Cmd: {' '.join(cmd)}")
+    logger.debug(f"Cmd: {cmd}")
     try:
-        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
+        return subprocess.run(shlex.split(cmd), stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=check, text=True)
     except subprocess.CalledProcessError as e:
-        logger.error(f"Cmd failed: {' '.join(cmd)}\n{e.stderr.strip()}")
+        logger.error(f"Cmd failed: {cmd}\n{e.stderr.strip()}")
         return None
     except (OSError, FileNotFoundError) as e:
         logger.error(f"Execution failed: {e}")
@@ -73,7 +74,7 @@ def run_command(cmd, check=True):
 def interface_exists(iface):
     try:
         iface = sanitize_interface_name(iface)
-        res = run_command(['ip', 'link', 'show', iface], check=False)
+        res = run_command(f'ip link show {iface}', check=False)
         return bool(res and res.returncode == 0)
     except ValueError:
         return False
@@ -82,7 +83,7 @@ def interface_exists(iface):
 def get_interface_info(iface):
     """Return (ip, prefixlen) or (None, None)."""
     iface = sanitize_interface_name(iface)
-    res = run_command(['ip', '-j', 'addr', 'show', iface], check=False)
+    res = run_command(f'ip -j addr show {iface}', check=False)
     if res and res.returncode == 0:
         try:
             data = json.loads(res.stdout)
@@ -92,7 +93,7 @@ def get_interface_info(iface):
                     return info[0]['local'], info[0]['prefixlen']
         except (json.JSONDecodeError, KeyError, IndexError):
             pass
-    res = run_command(['ip', '-br', 'addr', 'show', iface], check=False)
+    res = run_command(f'ip -br addr show {iface}', check=False)
     if res and res.returncode == 0:
         parts = res.stdout.split()
         if len(parts) >= 3:
@@ -105,21 +106,33 @@ def get_interface_info(iface):
 
 
 def get_current_max_metric():
-    res = run_command(['ip', 'route', 'show', 'default'], check=False)
+    res = run_command('ip -j route show default', check=False)
     max_metric = 0
     found_any_metric = False
     if res and res.stdout:
-        for line in res.stdout.splitlines():
-            parts = line.split()
-            if 'metric' in parts:
-                try:
-                    idx = parts.index('metric') + 1
-                    if idx < len(parts):
-                        m = int(parts[idx])
-                        max_metric = max(max_metric, m)
-                        found_any_metric = True
-                except (ValueError, IndexError):
-                    pass
+        try:
+            routes = json.loads(res.stdout)
+            for route in routes:
+                if 'metric' in route:
+                    max_metric = max(max_metric, route['metric'])
+                    found_any_metric = True
+        except json.JSONDecodeError:
+            pass  # Fallback to text parsing if JSON fails
+    if not found_any_metric:
+        # Fallback for older systems or if JSON parsing fails
+        res = run_command('ip route show default', check=False)
+        if res and res.stdout:
+            for line in res.stdout.splitlines():
+                parts = line.split()
+                if 'metric' in parts:
+                    try:
+                        idx = parts.index('metric') + 1
+                        if idx < len(parts):
+                            m = int(parts[idx])
+                            max_metric = max(max_metric, m)
+                            found_any_metric = True
+                    except (ValueError, IndexError):
+                        pass
     return max_metric if found_any_metric else DEFAULT_ROUTE_METRIC
 
 
@@ -127,8 +140,7 @@ def prefix_to_netmask(prefix):
     try:
         return str(ipaddress.IPv4Network(f"0.0.0.0/{prefix}").netmask)
     except Exception:
-        logger.error(f"Invalid prefix {prefix}")
-        sys.exit(1)
+        raise ValueError(f"Invalid prefix {prefix}")
 
 
 def store_configuration(iface):
@@ -174,17 +186,16 @@ def rollback_configuration(base, vlan, saved):
             return
             
         if not interface_exists(iface):
-            run_command(['ip', 'link', 'add', 'link', base, 'name', iface,
-                         'type', 'vlan', 'id', vlan_str])
-        run_command(['ip', 'link', 'set', iface, 'down'])
-        run_command(['ip', 'addr', 'flush', 'dev', iface])
+            run_command(f'ip link add link {base} name {iface} type vlan id {vlan_str}')
+        run_command(f'ip link set {iface} down')
+        run_command(f'ip addr flush dev {iface}')
         
         ip_addr = saved.get('ip')
         pref = saved.get('prefix')
         if ip_addr and pref:
             ip_addr = sanitize_ip_address(ip_addr)
-            run_command(['ip', 'addr', 'add', f"{ip_addr}/{pref}", 'dev', iface])
-        run_command(['ip', 'link', 'set', iface, 'up'])
+            run_command(f'ip addr add {ip_addr}/{pref} dev {iface}')
+        run_command(f'ip link set {iface} up')
         logger.info(f"Rolled back {iface}")
     except (ValueError, TypeError) as e:
         logger.error(f"Rollback failed: {e}")
@@ -223,18 +234,17 @@ def bring_vlan_up(args):
 
     try:
         write_config_file(os.path.join(args.config_dir, iface), lines)
-        res = run_command(['ifup', iface])
+        res = run_command(f'ifup {iface}')
         if not res or res.returncode != 0:
             raise RuntimeError(f"ifup failed for {iface}")
 
         # If a gateway was specified, delete auto routes then add ours
         if not args.dhcp and args.gateway:
             gateway = sanitize_ip_address(args.gateway)
-            run_command(['ip', 'route', 'del', 'default', 'dev', iface], check=False)
+            run_command(f'ip route del default dev {iface}', check=False)
             existing_max = get_current_max_metric()
             desired = max(existing_max + 1, args.metric)
-            run_command(['ip', 'route', 'add', 'default', 'via', gateway,
-                         'dev', iface, 'metric', str(desired)])
+            run_command(f'ip route add default via {gateway} dev {iface} metric {desired}')
             logger.info(f"Set default via {gateway} metric {desired}")
 
         logger.info(f"{iface} is up")
@@ -261,7 +271,8 @@ def bring_vlan_down(args):
             return
 
     try:
-        run_command(['ifdown', iface])
+        run_command(f'ip addr flush dev {iface}')
+        run_command(f'ifdown {iface}')
         if os.path.exists(config_path):
             os.remove(config_path)
             logger.info(f"Removed config file {config_path}")
@@ -307,11 +318,19 @@ Examples:
                         help='Skip confirmation prompts.')
     return parser.parse_args()
 
+def check_dependencies():
+    """Check for required commands."""
+    for cmd in ['ifup', 'ifdown']:
+        if not shutil.which(cmd):
+            logger.error(f"Required command not found: {cmd}. Please install the 'ifupdown' package.")
+            sys.exit(1)
 
 def main():
     args = parse_args()
     if os.geteuid() != 0 and not any(o in sys.argv for o in ('-h', '--help')):
         require_root()
+
+    check_dependencies()
 
     if not (1 <= args.vlan_id <= 4094):
         logger.error("VLAN ID must be between 1 and 4094")

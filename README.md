@@ -24,6 +24,7 @@ A robust Python script for managing VLAN interfaces on Debian-style Linux system
 - **Root privileges** (required for network configuration)
 - **Python 3.6+**
 - **Debian-based system** (Ubuntu, Debian, etc.) with `ifupdown` package
+- **Dependencies**: The script will check for the required `ifup` and `ifdown` commands and provide a helpful error message if they are not found.
 
 ### Basic Usage
 
@@ -133,18 +134,20 @@ sudo ./vlan_mgr.py 314 up \
 
 ### Interface Creation Process
 
-1. **Validation**: Validates VLAN ID, interface names, and IP addresses
-2. **Configuration Backup**: Stores existing interface configuration for rollback
-3. **Config File Creation**: Generates `/etc/network/interfaces.d/[interface]` file
-4. **Interface Activation**: Uses `ifup` to bring up the VLAN interface
-5. **State Verification**: Confirms interface is properly configured
-6. **Route Management**: Adds default routes with intelligent metric assignment
+1. **Dependency Check**: Checks for required commands like `ifup` and `ifdown`.
+2. **Validation**: Validates VLAN ID, interface names, and IP addresses
+3. **Configuration Backup**: Stores existing interface configuration for rollback
+4. **Config File Creation**: Generates `/etc/network/interfaces.d/[interface]` file
+5. **Interface Activation**: Uses `ifup` to bring up the VLAN interface
+6. **State Verification**: Confirms interface is properly configured
+7. **Route Management**: Adds default routes with intelligent metric assignment
 
 ### Automatic Rollback
 
 The script provides comprehensive error recovery:
 - **Config File Cleanup**: Removes configuration files on failure
 - **Interface Cleanup**: Removes newly created interfaces if setup fails
+- **IP Address Flushing**: Flushes the IP address from the interface on teardown
 - **State Restoration**: Restores previous interface configuration when possible
 
 ### Route Metric Logic
@@ -190,6 +193,8 @@ iface eth0.314 inet dhcp
 
 ### Common Issues
 
+### Common Issues
+
 **Interface doesn't exist**
 ```
 ERROR: Base interface eth0 does not exist
@@ -201,6 +206,12 @@ ERROR: Base interface eth0 does not exist
 ERROR: Must run as root
 ```
 *Solution*: Run with `sudo` or as root user
+
+**Missing Dependencies**
+```
+ERROR: Required command not found: ifup. Please install the 'ifupdown' package.
+```
+*Solution*: Install the `ifupdown` package using your system's package manager (e.g., `sudo apt-get install ifupdown`).
 
 **Invalid VLAN ID**
 ```
@@ -233,4 +244,16 @@ This script is designed for defensive network administration tasks. When contrib
 
 ## 📝 License
 
-This script is provided as-is for network administration purposes. Use at your own risk and always test in a development environment first.%
+This script is provided as-is for network administration purposes. Use at your own risk and always test in a development environment first.
+
+## ⚠️ Security Considerations
+
+**IMPORTANT**: This script requires root privileges and makes significant changes to system network configuration. Before using in production:
+
+- **Test thoroughly** in a development environment
+- **Validate all inputs** especially custom config directories to prevent path traversal
+- **Monitor system logs** for any unexpected behavior
+- **Backup network configurations** before making changes
+- **Verify base interface compatibility** with VLAN tagging before use
+
+Users should be aware that network configuration changes can affect system connectivity and should have out-of-band access when testing.
